@@ -1,0 +1,300 @@
+/*
+  Smartbuy ACTIVE / SBG-300BT-KR -> ESP32-S3 -> ACTIVE Control -> Xbox 360.
+  Чистый Arduino, без вызовов ESP-IDF.
+
+  Arduino IDE:
+  1. В Additional Boards Manager URLs добавить ОБА адреса:
+     https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+     https://raw.githubusercontent.com/ricardoquesada/esp32-arduino-lib-builder/master/bluepad32_files/package_esp32_bluepad32_index.json
+  2. Установить пакеты esp32 и esp32_bluepad32.
+  3. Board: ESP32S3 Dev Module из пакета ESP32 + Bluepad32 Arduino.
+  4. USB Mode: USB-OTG (TinyUSB).
+     USB CDC On Boot: Disabled. Core Debug Level: None.
+     Для вашей N16R8: Flash Size: 16MB (128Mb), PSRAM: OPI PSRAM.
+     Если это WROOM-1-N16R8: Flash Mode: QIO (не OPI Flash).
+     Partition Scheme: 16M Flash (3MB APP/9.9MB FATFS).
+  5. Установить Joystick_ESP32S2 автора schnoog через Library Manager.
+  6. Для USB-джойстика нужен родной USB ESP32-S3, НЕ USB-UART
+     разъём на CP210x/CH340. На вашей плате: USB = джойстик, COM = прошивка.
+     Используйте USB-кабель с передачей данных.
+
+  ESP32-S3 поддерживает только BLE, Bluetooth Classic здесь не работает.
+  В пакете Bluepad32 BLE HID host уже включён; отдельного Arduino-вызова
+  "подключиться к UUID 0x1812" нет. enableNewBluetoothConnections()
+  разрешает поиск/подключение, но не добавляет поддержку неизвестных HID.
+  Этот скетч принимает первое HID-устройство, без фильтра по имени;
+  игровые отчёты обрабатываются после определения типа устройства.
+
+  Если Smartbuy не распознаётся или кнопки неверные: отдельная прошивка
+  на NimBLE-Arduino вместо Bluepad32: найти HID service 0x1812, прочитать
+  Report Map 0x2A4B, Report Reference 0x2908, подписаться на INPUT Report
+  0x2A4D; при необходимости выполнить pairing/bonding. Формат кнопок и осей
+  определяется Report Map, угадывать байты по одному имени нельзя.
+  Не запускайте NimBLE и Bluetooth-стек Bluepad32 одновременно.
+
+  В прошивке v5 родной USB использует CDC (USB Serial), а не игровой HID.
+  USB CDC On Boot остаётся Disabled: USBCDC создаётся явно в скетче.
+  Приложение само находит новый COM-порт VID 303A / PID 1004.
+  По умолчанию USB передаёт данные только приложению ACTIVE Control,
+  которое создаёт Xbox 360/XInput. Это устраняет двойной ввод: игры
+  видят только виртуальный Xbox, а не ещё один физический HID-геймпад.
+  Для возврата отдельного DirectInput-джойстика через Joystick_ESP32S2
+  установите ACTIVE_CDC_TRANSPORT=0 и ACTIVE_EXCLUSIVE_XINPUT=0.
+
+  В v5 используется отдельный USBCDC; Joystick_ESP32S2 не запускается.
+  UART Serial используется только в отдельной диагностической сборке.
+*/
+
+#include <Arduino.h>
+#include <USB.h>
+#ifndef ACTIVE_CDC_TRANSPORT
+#define ACTIVE_CDC_TRANSPORT 1
+#endif
+#ifndef ACTIVE_EXCLUSIVE_XINPUT
+#define ACTIVE_EXCLUSIVE_XINPUT 1
+#endif
+#if ACTIVE_EXCLUSIVE_XINPUT
+#include "BridgeGameInput.h"
+#else
+#include <Joystick_ESP32S2.h>
+#endif
+#if ACTIVE_CDC_TRANSPORT
+#include "BridgeSerialControl.h"
+#else
+#include "BridgeControl.h"
+#endif
+
+// Bluepad32 4.1.0 (BTstack) и TinyUSB объявляют одинаковые HID-типы.
+// Сначала загрузить USB, затем локально переименовать символы BTstack.
+// Бинарный интерфейс библиотек не меняется; их файлы править не нужно.
+#define hid_report_type_t bp32_hid_report_type_t
+#define HID_REPORT_TYPE_INPUT BP32_HID_REPORT_TYPE_INPUT
+#define HID_REPORT_TYPE_OUTPUT BP32_HID_REPORT_TYPE_OUTPUT
+#define HID_REPORT_TYPE_FEATURE BP32_HID_REPORT_TYPE_FEATURE
+#include <Bluepad32.h>
+#undef hid_report_type_t
+#undef HID_REPORT_TYPE_INPUT
+#undef HID_REPORT_TYPE_OUTPUT
+#undef HID_REPORT_TYPE_FEATURE
+
+// В обычной сборке UART-диагностика отключена. Отдельный скетч
+// SmartbuyDiagnostics включает её для поиска проблем Bluetooth через COM.
+#ifndef BRIDGE_UART_DIAGNOSTICS
+#define BRIDGE_UART_DIAGNOSTICS 0
+#endif
+uint32_t receivedReports = 0;
+
+#if !defined(CONFIG_IDF_TARGET_ESP32S3)
+#error "Select ESP32S3 Dev Module from ESP32 + Bluepad32 Arduino"
+#endif
+
+struct GamepadState {
+  bool connected = false;
+  bool receivedReport = false;
+  uint16_t buttons = 0;
+  uint8_t misc = 0;
+  uint8_t dpad = 0;
+  int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+  int32_t brake = 0, throttle = 0;
+};
+
+GamepadState gamepadState;
+ControllerPtr activeController = nullptr;
+uint32_t lastInputMs = 0;
+
+#if ACTIVE_CDC_TRANSPORT
+BridgeSerialLink activeLink;
+#endif
+#if ACTIVE_EXCLUSIVE_XINPUT
+BridgeGameInput Joystick;
+#else
+Joystick_ Joystick(
+  JOYSTICK_DEFAULT_REPORT_ID, JOYSTICK_TYPE_GAMEPAD,
+  32, 1,                        // 32 кнопки, одна крестовина POV
+  true, true, false,            // X, Y; без Z
+  true, true, false,            // Rx, Ry; без Rz
+  false, true, false, true, false // только Throttle и Brake
+);
+#endif
+BridgeControl bridgeControl;
+
+// BP32 вызывает callbacks подключения/отключения внутри BP32.update().
+// В Arduino API нет отдельного зарегистрированного callback на каждый
+// input report. Наш обработчик onGamepadData() вызывается из loop()
+// после update()/hasData(). Все обращения к gamepadState идут из одного
+// Arduino-потока: volatile и межъядерные блокировки здесь не нужны.
+void onConnectedController(ControllerPtr ctl) {
+#if BRIDGE_UART_DIAGNOSTICS
+  const auto props = ctl->getProperties();
+  Serial.printf("BT_CONNECTED model=%s gamepad=%d VID=%04x PID=%04x\n",
+                ctl->getModelName().c_str(), ctl->isGamepad(),
+                props.vendor_id, props.product_id);
+#endif
+  // У generic BLE HID тип может определиться лишь после первого отчёта.
+  // Нельзя отбрасывать устройство по isGamepad() в callback подключения.
+  if (activeController == nullptr) {
+    activeController = ctl;
+    gamepadState = GamepadState{};
+    gamepadState.connected = true;
+  }
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+#if BRIDGE_UART_DIAGNOSTICS
+  Serial.println("BT_DISCONNECTED");
+#endif
+  if (ctl == activeController) {
+    activeController = nullptr;
+    gamepadState = GamepadState{}; // отпустить кнопки, центрировать стики
+  }
+}
+
+void onGamepadData(ControllerPtr ctl) {
+  ++receivedReports;
+  lastInputMs = millis();
+  gamepadState.connected = true;
+  gamepadState.receivedReport = true;
+  gamepadState.buttons = ctl->buttons();
+  gamepadState.misc = ctl->miscButtons();
+  gamepadState.dpad = ctl->dpad();
+  gamepadState.lx = ctl->axisX();
+  gamepadState.ly = ctl->axisY();
+  gamepadState.rx = ctl->axisRX();
+  gamepadState.ry = ctl->axisRY();
+  gamepadState.brake = ctl->brake();
+  gamepadState.throttle = ctl->throttle();
+}
+
+int32_t stickValue(int32_t value, uint8_t deadzonePercent) {
+  // Bluepad32: примерно -511..512. Симметричный выход с точным центром.
+  // Небольшая мёртвая зона; после неё масштаб восстанавливает полный ход.
+  const int32_t deadzone = deadzonePercent * 512L / 100;
+  value = constrain(value, -512L, 512L);
+  if (value > deadzone)
+    return (value - deadzone) * 32767L / (512 - deadzone);
+  if (value < -deadzone)
+    return (value + deadzone) * 32767L / (512 - deadzone);
+  return 0;
+}
+
+int16_t hatAngle(uint8_t dpad) {
+  // Биты Bluepad32: up=1, down=2, right=4, left=8.
+  int x = ((dpad & 4) ? 1 : 0) - ((dpad & 8) ? 1 : 0);
+  int y = ((dpad & 2) ? 1 : 0) - ((dpad & 1) ? 1 : 0);
+  if (y < 0) return x < 0 ? 315 : (x > 0 ? 45 : 0);
+  if (y > 0) return x < 0 ? 225 : (x > 0 ? 135 : 180);
+  return x < 0 ? 270 : (x > 0 ? 90 : -1);
+}
+
+void sendUsbState() {
+  GamepadState state = gamepadState;
+  if (!state.connected || !state.receivedReport) state = GamepadState{};
+
+  // USB кнопки 1..16 = биты buttons(), 17..24 = биты miscButtons().
+  // 25/26 = цифровое представление L2/R2 (параллельно аналоговым осям).
+  // В setButton() нумерация начинается с 0; в Windows обычно с 1.
+  uint32_t mask = uint32_t(state.buttons) | (uint32_t(state.misc) << 16);
+  const BridgeConfig& config = bridgeControl.config;
+  if (state.brake > config.threshold * 1023L / 100) mask |= (1UL << 24);
+  if (state.throttle > config.threshold * 1023L / 100) mask |= (1UL << 25);
+  uint32_t mapped = 0;
+  for (uint8_t i = 0; i < 32; ++i)
+    if ((mask & (1UL << i)) && config.mapping[i] < 32)
+      mapped |= 1UL << config.mapping[i];
+  for (uint8_t i = 0; i < 32; ++i)
+    Joystick.setButton(i, (mapped >> i) & 1U);
+
+  int32_t axes[] = {stickValue(state.lx, config.leftDeadzone),
+                    stickValue(state.ly, config.leftDeadzone),
+                    stickValue(state.rx, config.rightDeadzone),
+                    stickValue(state.ry, config.rightDeadzone)};
+  for (uint8_t i = 0; i < 4; ++i) if (config.invert & (1U << i)) axes[i] = -axes[i];
+  Joystick.setXAxis(axes[config.swapSticks ? 2 : 0]);
+  Joystick.setYAxis(axes[config.swapSticks ? 3 : 1]);
+  Joystick.setRxAxis(axes[config.swapSticks ? 0 : 2]);
+  Joystick.setRyAxis(axes[config.swapSticks ? 1 : 3]);
+  Joystick.setBrake(constrain(state.brake, 0L, 1023L));
+  Joystick.setThrottle(constrain(state.throttle, 0L, 1023L));
+  Joystick.setHatSwitch(0, hatAngle(state.dpad));
+  Joystick.sendState(); // один цельный USB-репорт
+}
+
+void setup() {
+#if BRIDGE_UART_DIAGNOSTICS
+  Serial.begin(115200); // CDC отключён: вывод только через разъём COM
+  Serial.println("SMARTBUY_DIAGNOSTICS: UART=COM, baud=115200");
+#endif
+  Joystick.setXAxisRange(-32767, 32767);
+  Joystick.setYAxisRange(-32767, 32767);
+  Joystick.setRxAxisRange(-32767, 32767);
+  Joystick.setRyAxisRange(-32767, 32767);
+  Joystick.setBrakeRange(0, 1023);
+  Joystick.setThrottleRange(0, 1023);
+  Joystick.begin(false); // отключить автоотправку каждого setButton()
+  bridgeControl.begin();
+#if ACTIVE_EXCLUSIVE_XINPUT
+#if ACTIVE_CDC_TRANSPORT
+  USB.PID(0x1004);
+  USB.firmwareVersion(0x0500);
+#else
+  USB.PID(0x1003);
+  USB.firmwareVersion(0x0400);
+#endif
+#else
+  USB.PID(0x1002);
+  USB.firmwareVersion(0x0200);
+#endif
+  USB.productName("Smartbuy ACTIVE Bridge");
+  USB.begin();           // запустить родной USB ESP32-S3
+
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+  BP32.enableVirtualDevice(false);
+  BP32.enableNewBluetoothConnections(true);
+  // При проблемах pairing можно ОДИН РАЗ раскомментировать строку ниже,
+  // загрузить, затем снова закомментировать и перезагрузить прошивку.
+  // BP32.forgetBluetoothKeys();
+}
+
+void loop() {
+  bridgeControl.service();
+  const bool updated = BP32.update();
+  if (updated && activeController != nullptr &&
+      activeController->isConnected() && activeController->hasData() &&
+      activeController->isGamepad()) {
+    onGamepadData(activeController);
+  }
+
+  static uint32_t lastUsbMs = 0;
+  const uint32_t now = millis();
+  if (now - lastUsbMs >= 10) {
+    lastUsbMs = now;
+    sendUsbState();
+  }
+  static uint32_t lastStatusMs = 0;
+  if (now - lastStatusMs >= 20) {
+    lastStatusMs = now;
+    uint32_t raw = uint32_t(gamepadState.buttons) | (uint32_t(gamepadState.misc) << 16);
+    if (gamepadState.brake > 128) raw |= 1UL << 24;
+    if (gamepadState.throttle > 128) raw |= 1UL << 25;
+    bridgeControl.publish(gamepadState.connected, gamepadState.receivedReport,
+      receivedReports, lastInputMs, raw, gamepadState.lx, gamepadState.ly,
+      gamepadState.rx, gamepadState.ry, gamepadState.brake, gamepadState.throttle,
+      gamepadState.dpad, activeController ? activeController->battery() : 0);
+  }
+  delay(1); // дать Bluetooth/USB задачам процессорное время
+#if BRIDGE_UART_DIAGNOSTICS
+  static uint32_t lastDiagnosticMs = 0;
+  if (now - lastDiagnosticMs >= 2000) {
+    lastDiagnosticMs = now;
+    Serial.printf("STATE connected=%d gamepad=%d report=%d count=%lu buttons=%04x "
+                  "dpad=%02x LX=%ld LY=%ld RX=%ld RY=%ld\n",
+                  gamepadState.connected,
+                  activeController ? activeController->isGamepad() : false,
+                  gamepadState.receivedReport,
+                  (unsigned long)receivedReports, gamepadState.buttons,
+                  gamepadState.dpad, (long)gamepadState.lx,
+                  (long)gamepadState.ly, (long)gamepadState.rx,
+                  (long)gamepadState.ry);
+  }
+#endif
+}

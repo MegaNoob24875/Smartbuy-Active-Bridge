@@ -1,0 +1,36 @@
+name: Windows build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['active_control/**', 'packaging/**', 'tools/**', 'build-windows.ps1', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['active_control/**', 'packaging/**', 'tools/**', 'build-windows.ps1', '.github/workflows/windows.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      VGAMEPAD_SKIP_VIGEMBUS_INSTALL: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Dependencies
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r active_control/requirements.txt pyinstaller==6.22.3
+      - name: Unit tests
+        working-directory: active_control
+        run: ..\.venv\Scripts\python.exe -m unittest test_protocol test_xinput test_serial_protocol
+      - name: Build and smoke test
+        run: .\build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ACTIVE-Control-Windows-x64
+          path: |
+            dist/ACTIVE-Control.exe
+            build/windows/smoke-test.json

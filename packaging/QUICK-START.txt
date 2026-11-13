@@ -1,0 +1,21 @@
+ACTIVE CONTROL — Windows x64
+
+1. Install ViGEmBus 1.22.0 once (official release):
+   https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0
+2. Flash the ESP32-S3 with firmware v5 through its COM connector.
+3. Connect the board's native USB connector and launch ACTIVE-Control.exe.
+4. Pair the BLE gamepad and press a button. Wait for Xbox 360 in the app.
+
+Keep the application running while playing. The X button minimizes to tray.
+Use File -> Exit to disconnect the virtual Xbox and close the application.
+Settings and logs: %LOCALAPPDATA%\SmartbuyActiveControl
+
+Firmware, Russian instructions and source:
+https://github.com/MegaNoob24875/Smartbuy-Active-Bridge
+
+Supported/tested: Smartbuy ACTIVE / SBG-300BT-KR, ESP32-S3 N16R8.
+Other models require BLE and support in Bluepad32. Bluetooth Classic is not
+available on ESP32-S3. Rumble return and keyboard emulation are not implemented.
+
+The application is unsigned. No Python installation is needed to run it.
+The EXE does not install any driver automatically. See THIRD_PARTY_NOTICES.md.

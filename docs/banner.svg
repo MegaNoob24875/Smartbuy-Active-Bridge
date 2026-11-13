@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280">
+<defs><linearGradient id="bg"><stop stop-color="#0b1729"/><stop offset="1" stop-color="#143e65"/></linearGradient><pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#fff" stroke-opacity=".04"/></pattern></defs>
+<rect width="1200" height="280" rx="24" fill="url(#bg)"/><rect width="1200" height="280" rx="24" fill="url(#grid)"/>
+<rect x="62" y="62" width="156" height="156" rx="34" fill="#0078d4"/>
+<rect x="84" y="111" width="112" height="63" rx="22" fill="white"/><path d="M102 141h27m-13-13v26" stroke="#0078d4" stroke-width="9" stroke-linecap="round"/>
+<g fill="#0078d4"><circle cx="171" cy="129" r="5"/><circle cx="183" cy="141" r="5"/><circle cx="159" cy="141" r="5"/><circle cx="171" cy="153" r="5"/></g>
+<text x="258" y="126" fill="white" font-family="Segoe UI,Arial,sans-serif" font-size="54" font-weight="700">ACTIVE Control</text>
+<text x="261" y="171" fill="#aec9e2" font-family="Segoe UI,Arial,sans-serif" font-size="23">Smartbuy · ESP32-S3 · Xbox 360</text>
+<rect x="899" y="105" width="230" height="55" rx="27" fill="#173f57" stroke="#409481"/>
+<circle cx="926" cy="133" r="6" fill="#42dfaa"/><text x="945" y="141" fill="#d8fff1" font-family="Segoe UI,Arial,sans-serif" font-size="20">BLE → USB → XInput</text>
+</svg>
